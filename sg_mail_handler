@@ -1,0 +1,434 @@
+#!/bin/env python
+################################################################################
+# Parse incoming mail messages and act on them accordingly
+#
+# Ticket Rules:
+#   If Subject has '[Ticket #\d+]' in it, then it is a reply to the ticket
+#   Otherwise a new ticket is created
+#
+#   Attachments are uploaded as attachments to Shotgun
+#
+#   If a line in the body is a field on Ticket, then the ticket is updated with
+#   the value in the line.  Supported fields are: Status, Priority, Tags,
+#   Assigned To, Requested By, Title, and CC
+#   For example:
+#         Status: res
+#         Priority: 2.1
+#         Tags: tag_1, tag_2
+#         Cc: foo, rblau
+#         Assigned To: rblau
+#         Requested By: rblau
+#         Title: New Title
+#         Type: Project
+################################################################################
+
+import os
+import re
+import sys
+import email
+import shutil
+import atexit
+import logging
+import smtplib
+import tempfile
+import optparse
+from email.MIMEText import MIMEText
+
+# Debug email constants
+EMAIL_FROM = 'sg-mail@localhost'
+EMAIL_SUBJ = '[sg_mail] Logging Output'
+DEBUG_EMAIL = 'send_debug_output_here@hostname.org'
+
+# Shotgun connection, only create if needed
+# short-name: (url, script name, script key)
+SG_SERVERS = {
+    'shotgun-a': ('http://shotgun.mystudio.com', 'sg_email_bot', '1234567890abcdef1234567890abcdef12345678'),
+    'shotgun-b': ('http://shotgun.otherstudio.com', 'sg_email_bot', '1234567890abcdef1234567890abcdef12345678'),
+}
+# project: shotgun server (a key from SG_SERVERS)
+SG_SHOWS = {
+    'proj_a': 'shotgun-a',
+}
+LIB_DIR = '/path/to/shotgun/api'
+
+# To field mappings
+# to: entity type
+TO_MAP = {
+    'stix': 'Ticket',
+    'sg-notes': 'Note',
+}
+# REs to parse the subject
+SUBJECT_REs = [
+    ('Ticket', re.compile(r'\[Ticket')),
+]
+
+# Fields that tickets will handle
+# prety name: shotgun field
+TICKET_FIELDS = {
+    'status': 'sg_status_list',
+    'priority': 'sg_priority',
+    'tags': 'tag_list',
+    'cc': 'addressings_cc',
+    'assigned to': 'addressings_to',
+    'requested by': 'sg_requested_by',
+    'title': 'title',
+    'type': 'sg_ticket_type'
+}
+
+MSG = None
+
+################################################################################
+def process_msg(msg, tmpdir):
+    body = None
+    files = []
+    for part in msg.walk():
+        # multipart/* are just containers
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        if filename:
+            # this is an attachment, save in tmp dir
+            tmpfile = os.path.join(tmpdir, filename)
+            fd = open(tmpfile, 'wb')
+            fd.write(part.get_payload(decode=True))
+            fd.close()
+            files.append(tmpfile)
+            logging.debug("wrote %s", tmpfile)
+        elif part.get_content_type() == 'text/plain':
+            # not an attachment... should verify this is correct
+            # skip unles this is plain text, not dealing with HTML content
+            body = part.get_payload().strip()
+    # Email parsed
+    entity_type = None
+    for (to, type) in TO_MAP.iteritems():
+        if msg['to'].startswith(to):
+            entity_type = type
+    if entity_type is None:
+        for (type, regex) in SUBJECT_REs:
+            if regex.search(msg['subject']):
+                entity_type = type
+    if entity_type is None:
+        # defaults to notes
+        entity_type = 'Note'
+    return (entity_type, body, files)
+
+################################################################################
+def send_error_email(to, body):
+    msg = MIMEText('There was an error parsing your email:\n\n %s' % body)
+    msg['Subject'] = "[Shotgun Email Bot] Error"
+    msg['From'] = "Shotgun Email Bot <shotgun-bot@localhost>"
+    msg['To'] = to
+    s = smtplib.SMTP()
+    s.connect()
+    s.sendmail(msg['From'], [a.strip() for a in msg['To'].split(',')], msg.as_string())
+
+################################################################################
+def msg_summary(msg):
+    return """From: %s
+To: %s
+Reply-To: %s
+Subject: %s""" % (msg['from'], msg['to'], msg['reply-to'], msg['subject'])
+
+################################################################################
+def login_for_email(email):
+    login = re.search('([a-zA-Z0-9+_\-\.]+)@[0-9a-zA-Z][.-0-9a-zA-Z]*.[a-zA-Z]+', email).group(1)
+    logging.debug('email (%s) parsed to login (%s)' % (email, login))
+    return login
+
+################################################################################
+NOTE_COMMAND_RE = re.compile('^:(?P<cmd>\w+):\s*(?P<val>.*)$', re.MULTILINE)
+NAME_ID_RE = re.compile('(?P<name>.+?)( \(id (?P<id>\d+)\))?$')
+def parse_note(msg, body, mock=False):
+    to = []
+    notes = []
+    version = None
+    playlist = None
+    connection = None
+    current_note = ''
+    current_subject = ''
+    for line in body.splitlines():
+        match = NOTE_COMMAND_RE.match(line)
+        if match:
+            d = match.groupdict()
+            logging.debug('command matched: %s (%s)', d['cmd'], d['val'])
+            if d['cmd'] == 'show':
+                if connection is not None:
+                    raise ValueError('Only one occurance of show supported per email.')
+                # switch to given show, connect
+                server = SG_SHOWS.get(d['val'].strip())
+                connection = connect_to_shotgun(server)
+            elif d['cmd'] == 'playlist':
+                if playlist is not None:
+                    raise ValueError('Only one occurance of playlist supported per email.')
+                match = NAME_ID_RE.search(d['val'].strip())
+                if not match:
+                    raise ValueError('Could not find value for playlist: %s' % line)
+                d = match.groupdict()
+                if d['id']:
+                    playlist = dict(type='Playlist', id=int(d['id']))
+                else:
+                    # lookup playlist by name
+                    raise NotImplementedError('Not looking up by name yet: %s' % line)
+            elif d['cmd'] == 'to':
+                to = [t.strip() for t in d['val'].strip().split(',')]
+            elif d['cmd'] == 'subject':
+                current_subject = d['val'].strip()
+            else:
+                raise ValueError('Unknown command in email: "%s"' % d['cmd'])
+        elif line.startswith('***'):
+            # new section, create note if we're finishing one up
+            current_note = current_note.strip()
+            if current_note:
+                note = dict(content=current_note)
+                if to:
+                    note['addressings_to'] = to
+                if current_subject:
+                    note['subject'] = current_subject
+                note['note_links'] = [version, playlist]
+                notes.append(note)
+                logging.debug('appending note: %s', note)
+            # and initialize values for the next note
+            match = NAME_ID_RE.search(line[2:].strip())
+            if not match:
+                raise ValueError('Could not find version for section: %s' % line)
+            d = match.groupdict()
+            logging.debug('starting note for %s (%s)', d['name'], d['id'])
+            if d['id']:
+                version = dict(type='Version', id=int(d['id']))
+            else:
+                # lookup by name and playlist
+                raise NotImplementedError('Not looking up by name yet: %s' % line)
+            to = []
+            current_note = ''
+        else:
+            # just append to note
+            current_note = "%s\n%s" % (current_note, line)
+    # finish the last note
+    current_note = current_note.strip()
+    if current_note:
+        note = dict(content=current_note)
+        if to:
+            note['addressings_to'] = to
+        if current_subject:
+            note['subject'] = current_subject
+        note['note_links'] = [version, playlist]
+        notes.append(note)
+        logging.debug('appending note: %s', note)
+    # done parsing lines
+    from_login = login_for_email(msg['From'])
+    if connection is None:
+        raise ValueError('Could not parse connection information')
+    create_notes(connection, from_login, notes, mock)
+
+def create_notes(connection, from_login, notes, mock):
+    # go through the 'to' fields and grab the users from shotgun
+    logins = [from_login]
+    for n in notes:
+        logins.extend(n['addressings_to'])
+    logins = list(set(logins))
+    filt = [['login', 'is', l] for l in logins]
+    people = dict([(d['login'], d) for d in connection.find('HumanUser', filt, filter_operator='any', fields=['login'])])
+    # go through the link fields and grab the versions from shotgun
+    version_ids = []
+    for n in notes:
+        version_ids.extend([v['id'] for v in n['note_links'] if v['type'] == 'Version'])
+    filt = [['id', 'is', i] for i in version_ids]
+    logging.debug('filter: %s', filt)
+    vers = dict([(d['id'], d) for d in connection.find('Version', filt, filter_operator='any', fields=['sg_task', 'entity', 'project'])])
+    logging.debug('returned versions: %s', vers)
+    # put together the create commands for each note
+    batch = []
+    for note in notes:
+        data = {
+                'addressings_to': [people[l] for l in note['addressings_to'] if people.has_key(l)],
+                'content': note['content'],
+                'created_by': people.get(from_login, None),
+                'user': people.get(from_login, None),
+                # version, version task, version link, playlist
+                'note_links': note['note_links'],
+             }
+        if note.has_key('subject'):
+            data['subject'] = note['subject'],
+        # copy some info from the version over
+        ver = [e for e in note['note_links'] if e['type'] == 'Version'][0]
+        if vers[ver['id']]['sg_task'] is not None:
+            data['note_links'].append(vers[ver['id']]['sg_task'])
+        if vers[ver['id']]['entity'] is not None:
+            data['note_links'].append(vers[ver['id']]['entity'])
+        if vers[ver['id']]['project'] is not None:
+            data['project'] = vers[ver['id']]['project']
+        # and add the command to the batch create request
+        batch.append({'request_type': 'create', 'entity_type': 'Note', 'data': data})
+    import pprint
+    logging.debug("Batch query: %s", pprint.pformat(batch))
+    if not mock:
+        connection.batch(batch)
+
+################################################################################
+TICKET_SUBJECT_RE = re.compile('\[Ticket #(\d+)')
+def parse_ticket(msg, files, body, conn, mock=False):
+    logging.debug("parse_ticket(msg, %s, body, conn)" % files)
+    # find from user
+    try:
+        login = login_for_email(msg['From'])
+        sg_from = conn.find_one('HumanUser', [['login', 'is', login]])
+    except StandardError:
+        sg_from = None
+    # see if the subject indicates that this is an already existing ticket
+    m = TICKET_SUBJECT_RE.search(msg['subject'])
+    if m:
+        id = int(m.group(1))
+        ticket = conn.find_one('Ticket', [['id', 'is', id]])
+        if ticket is None:
+            error_msg = 'Could not find ticket with id #%s in Shotgun.' % id
+            send_error_email(msg['Reply-To'] or msg['From'], error_msg)
+            raise ValueError("%s\n\n%s" % (msg_summary(msg), error_msg))
+    else:
+        ticket = {}
+        # initialize the Cc: to match the email's
+        if msg['Cc']:
+            ccs = []
+            for addy in [addy.strip() for addy in msg['Cc'].split(',')]:
+                cc = login_for_email(addy)
+                if cc is not None:
+                    ccs.append(cc)
+            if ccs:
+                ticket['addressings_cc'] = ','.join(ccs)
+    # parse the body for control sequences
+    in_lines = body.split('\n')
+    out_lines = []
+    for line in in_lines:
+        found = False
+        for (field, sg_field) in TICKET_FIELDS.iteritems():
+            if line.lower().startswith("%s:" % field):
+                found = True
+                ticket[sg_field] = line[len(field)+1:].strip()
+        if not found:
+            out_lines.append(line)
+    body = '\n'.join(out_lines)
+    # fix up fields that require special processing
+    if ticket.has_key('tag_list'):
+        ticket['tag_list'] = [tag.strip() for tag in ticket['tag_list'].split(',')]
+    for field in ['addressings_cc', 'addressings_to', 'sg_requested_by']:
+        if ticket.has_key(field):
+            new_value = []
+            for login in [l.strip() for l in ticket[field].split(',')]:
+                ent = conn.find_one('HumanUser', [['login', 'is', login]])
+                if ent:
+                    new_value.append(ent)
+                if field == 'sg_requested_by' and new_value:
+                    new_value = new_value[0]
+            if new_value:
+                ticket[field] = new_value
+            else:
+                del ticket[field]
+    if ticket.has_key('sg_priority'):
+        ticket['sg_priority'] = float(ticket['sg_priority'])
+    # update in shotgun
+    if ticket.has_key('id'):
+        id = ticket['id']
+        reply = {'entity': {'type': 'Ticket', 'id': id}, 'user': sg_from, 'content': body}
+        del ticket['id']
+        del ticket['type']
+        if ticket:
+            logging.debug('update(%d, %s)' % (id, ticket))
+        logging.debug('reply create(%s)' % (reply))
+        if not mock:
+            if ticket:
+                conn.update('Ticket', id, ticket)
+            conn.create('Reply', reply)
+    else:
+        # default to the prod tech project
+        ticket['project'] = {'type': 'Project', 'id': 109}
+        ticket['description'] = body.strip()
+        ticket['created_by'] = sg_from
+        if not ticket.has_key('sg_status_list'):
+            ticket['sg_status_list'] = 'opn'
+        if not ticket.has_key('title'):
+            ticket['title'] = msg['subject']
+        if not ticket.has_key('sg_requested_by'):
+            ticket['sg_requested_by'] = sg_from
+        logging.debug('create(%s)' % ticket)
+        if not mock:
+            id = conn.create('Ticket', ticket)['id']
+    # upload attachments
+    if not mock:
+        for f in files:
+            f_id = conn.upload('Ticket', id, f)
+            data = {
+                'sg_path_to_file': f,
+                # 'created_by': sg_from, # can't edit this after the fact yet
+            }
+            conn.update('Attachment', f_id, data)
+
+################################################################################
+def connect_to_shotgun(server):
+    if LIB_DIR not in sys.path:
+        sys.path.append(LIB_DIR)
+    # Bring symbols we use from the API into our namespace
+    from shotgun_api3 import Shotgun
+    (url, script, key) = SG_SERVERS[server]
+    return Shotgun(url, script, key)
+
+################################################################################
+# System level methods
+
+# default exception handler
+def excepthook(type, value, traceback):
+    logging.error('EXCEPTION', exc_info=(type, value, traceback))
+    sys.exit(0)
+
+# registered with atexit
+def goodbye():
+    global MSG
+    # email debug output
+    fh = open(log_file)
+    msg_body = fh.read()
+    fh.close()
+    if msg_body:
+        msg_body = "%s\n\n%s" % (msg_body, MSG)
+        # email the log
+        msg = MIMEText(msg_body)
+        msg['Subject'] = EMAIL_SUBJ
+        msg['From'] = EMAIL_FROM
+        msg['To'] = opts.email
+        s = smtplib.SMTP()
+        s.connect()
+        s.sendmail(EMAIL_FROM, [addr.strip() for addr in opts.email.split(',')], msg.as_string())
+        s.quit()
+    shutil.rmtree(tmpdir)
+
+################################################################################
+# main
+if __name__ == "__main__":
+    usage = 'usage %prog [options]'
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option('--mock', '-n', action="store_true")
+    parser.add_option('--debug', action="store_true")
+    parser.add_option('--logging_email', dest="email")
+    parser.set_defaults(mock=False, debug=False, email=DEBUG_EMAIL)
+    (opts, args) = parser.parse_args()
+    if args:
+        parser.print_usage()
+        sys.exit(1)
+    # tmpdir, cleaned by exit handler
+    tmpdir = tempfile.mkdtemp()
+    # setup python services to be daemon friendly
+    sys.excepthook = excepthook
+    atexit.register(goodbye)
+    # setup logging
+    log_file = os.path.join(tmpdir, 'debug.log')
+    logging.basicConfig(level=(opts.debug and logging.DEBUG or logging.ERROR), filename=log_file)
+    # grab info out of messages
+    msg = email.message_from_file(sys.stdin)
+    MSG = str(msg)
+    # do stuff
+    (entity_type, body, files) = process_msg(msg, tmpdir)
+    if entity_type == 'Ticket':
+        # connect to shotgun-dev
+        conn = connect_to_shotgun('shotgun-b')
+        parse_ticket(msg, files, body, conn, mock=opts.mock)
+    elif entity_type == 'Note':
+        parse_note(msg, body, mock=opts.mock)
+    else:
+        raise ValueError("Unknown entity type (%s)" % entity_type)

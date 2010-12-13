@@ -1,0 +1,41 @@
+These scripts are meant to be hooked into an email system to automatically
+parse mails as they are received and take automatic actions based on the
+content of the email.
+
+Installation depends on the particulars of the mail system they are being
+used on.  For sendmail, they are installed by copying them into the /etc/smrsh
+directory and by adding lines like the following to /etc/aliases:
+
+stix:                "|/etc/smrsh/run sg_mail_handler"
+stix-debug:          "|/etc/smrsh/run sg_mail_handler --debug"
+sg-notes:            "|/etc/smrsh/run sg_mail_handler"
+sg-notes-debug:      "|/etc/smrsh/run sg_mail_handler --debug"
+sg-auto-email:       "|/etc/smrsh/run sg_mail_handler"
+sg-auto-email-debug: "|/etc/smrsh/run sg_mail_handler --debug"
+
+then running 'newaliases'.
+
+sg-auto-email@shotgun.yourstudio.com would be the reply-to email address for
+emails sent out by Shotgun.  This is configured on the Shotgun preferences page.
+
+The script is currently configured so that email to stix will create a new ticket
+and email to sg-notes will create notes.  sg-notes emails are expected to have a
+body following this template (in a plain text email):
+
+:show: project_a
+:playlist: playlist_name (id 2219)
+:subject: 
+
+*** version1 name (id 91306)
+
+notes to make on version 1
+
+*** version2 name (id 114239)
+:to: login1
+
+notes to make on version2
+
+*** version3 (id 114247)
+:to: login2
+
+notes to make on version 2
